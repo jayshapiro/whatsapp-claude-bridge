@@ -64,6 +64,14 @@ MCP_SERVERS: Dict[str, Dict[str, Any]] = {
         "env": {},
         "description": "Google Tasks — create, list, search, update, delete tasks and reminders",
     },
+    "google-drive": {
+        "command": "C:\\Program Files\\nodejs\\node.exe",
+        "args": ["C:\\Users\\jay\\google-drive-mcp\\node_modules\\@piotr-agier\\google-drive-mcp\\dist\\index.js"],
+        "env": {
+            "GOOGLE_DRIVE_OAUTH_CREDENTIALS": "C:\\Users\\jay\\google-drive-mcp\\node_modules\\@piotr-agier\\gcp-oauth.keys.json",
+        },
+        "description": "Google Drive — search, upload, create, move, rename, delete files. Use uploadFile to upload local files (images, audio, video, etc.) to Drive.",
+    },
 }
 
 
