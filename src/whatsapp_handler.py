@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from twilio.rest import Client
 
@@ -27,6 +27,36 @@ class WhatsAppHandler:
             )
             sids.append(msg.sid)
         return sids
+
+    def send_media(
+        self,
+        to_number: str,
+        media_url: str,
+        body: Optional[str] = None,
+    ) -> str:
+        """Send a media message (image, audio, video) via WhatsApp.
+
+        Args:
+            to_number: Recipient phone number
+            media_url: Public URL of the media file (must be HTTPS and publicly accessible)
+            body: Optional caption text
+
+        Returns:
+            The Twilio message SID
+        """
+        to_number = self._normalise(to_number)
+        kwargs = {
+            "from_": self.from_number,
+            "to": to_number,
+            "media_url": [media_url],
+        }
+        if body:
+            kwargs["body"] = body
+        else:
+            kwargs["body"] = ""
+        msg = self.client.messages.create(**kwargs)
+        print(f"[WHATSAPP] Sent media to {to_number}: {media_url[:80]}... SID={msg.sid}", flush=True)
+        return msg.sid
 
     def send_approval_request(
         self, to_number: str, description: str, approval_id: str

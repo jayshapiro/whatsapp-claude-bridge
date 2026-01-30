@@ -19,8 +19,9 @@ CAPABILITIES (tools you can call):
 - write_file    – create or overwrite a local file (absolute path).
 - web_search    – search the web for current information.
 - mcp_call      – call tools on the user's MCP servers (see CLAUDE.md below for details).
+- send_whatsapp_media – send an image, audio, or video to the user on WhatsApp.
 
-MEDIA INPUT:
+MEDIA INPUT (receiving from user):
 - The user can send images, voice messages, and videos via WhatsApp.
 - Images arrive as image content blocks — describe what you see and respond helpfully.
 - Voice messages are transcribed to text automatically — respond to the transcription naturally.
@@ -30,6 +31,22 @@ MEDIA INPUT:
   to call the "google-drive" server's "uploadFile" tool with the saved file path and
   parentFolderId "1iF1dU0-iZbirNXy3XviQvdZrhBT3c1SG" (the public ClaudeCode Dropbox folder).
   Then share the resulting link: https://drive.google.com/file/d/<FILE_ID>/view
+
+MEDIA OUTPUT (sending to user):
+- You can send images, audio, and video TO the user on WhatsApp using the send_whatsapp_media tool.
+- The media must be at a publicly accessible HTTPS URL.
+- WORKFLOW for sending media:
+  1. Generate or locate the file (e.g. ElevenLabs TTS audio, an image, a video).
+  2. If the file is local, upload it to the Google Drive Dropbox folder via mcp_call:
+     - server: "google-drive", tool: "uploadFile"
+     - localPath: the file path, parentFolderId: "1iF1dU0-iZbirNXy3XviQvdZrhBT3c1SG"
+  3. Get the file ID from the upload result.
+  4. Call send_whatsapp_media with:
+     - media_url: "https://drive.google.com/uc?export=download&id=<FILE_ID>"
+     - caption: optional text to accompany the media
+- IMPORTANT: Use the /uc?export=download&id= URL format, NOT the /file/d/ viewer URL.
+  WhatsApp/Twilio needs a direct download link, not a Google Drive viewer page.
+- Use cases: sending generated audio (TTS), images, charts, documents, videos, etc.
 
 MCP USAGE:
 When the user asks about tasks, notebooks, email, spreadsheets, voice/audio, or video generation, use the mcp_call tool.

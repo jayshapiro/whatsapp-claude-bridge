@@ -25,6 +25,7 @@ from .tools.bash_tool import BashTool
 from .tools.file_tool import FileReadTool, FileWriteTool
 from .tools.web_search_tool import WebSearchTool
 from .tools.mcp_tool import MCPBridgeTool
+from .tools.send_media_tool import SendWhatsAppMediaTool
 
 # ── Initialise components ────────────────────────────────────────
 
@@ -33,7 +34,7 @@ app = FastAPI(title="WhatsApp-Claude Bridge")
 engine = create_engine(settings.database_url, echo=False)
 SQLModel.metadata.create_all(engine)
 
-tools = [BashTool(), FileReadTool(), FileWriteTool(), WebSearchTool(), MCPBridgeTool()]
+tools = [BashTool(), FileReadTool(), FileWriteTool(), WebSearchTool(), MCPBridgeTool(), SendWhatsAppMediaTool()]
 claude = ClaudeClient(tools=tools)
 conversations = ConversationManager(engine)
 whatsapp = WhatsAppHandler()
@@ -270,6 +271,9 @@ async def _process(from_number: str, text: str, media_items: list | None = None)
                     else:
                         result = await claude.execute_tool(name, inputs)
 
+                    # ── Check for media send marker ──
+                    result = _handle_media_send(from_number, result)
+
                     # persist tool result
                     conversations.add_message(
                         conv.id, "tool_result", result,
@@ -357,6 +361,28 @@ async def _request_approval(
 
     whatsapp.send_message(phone, f"Approval {aid} expired.")
     return False
+
+
+# ── Outbound media ────────────────────────────────────────────────
+
+def _handle_media_send(to_number: str, tool_result: str) -> str:
+    """Intercept the send_whatsapp_media tool's JSON marker and actually send media.
+
+    If the result is a media-send marker, we send the media via WhatsApp
+    and return a confirmation string for Claude's context.
+    Otherwise, the result passes through unchanged.
+    """
+    try:
+        data = json.loads(tool_result)
+        if isinstance(data, dict) and data.get("__media_send__"):
+            media_url = data["media_url"]
+            caption = data.get("caption", "")
+            print(f"[MEDIA OUT] Sending media to {to_number}: {media_url[:80]}", flush=True)
+            sid = whatsapp.send_media(to_number, media_url, caption or None)
+            return f"Media sent successfully to user. SID: {sid}"
+    except (json.JSONDecodeError, TypeError, KeyError):
+        pass
+    return tool_result
 
 
 # ── Helpers ──────────────────────────────────────────────────────
