@@ -33,6 +33,31 @@ _VIDEO_TYPES = {
 # Max image size to send to Claude (5 MB base64 ≈ 3.75 MB raw)
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
+# Directory for persisting inbound media (survives across tool calls)
+_MEDIA_DIR = Path(tempfile.gettempdir()) / "whatsapp_media"
+_MEDIA_DIR.mkdir(exist_ok=True)
+
+# Extension map for saving files
+_EXT_MAP = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp", "audio/ogg": ".ogg", "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a", "audio/amr": ".amr", "audio/aac": ".aac",
+    "audio/opus": ".opus", "video/mp4": ".mp4", "video/3gpp": ".3gp",
+    "video/quicktime": ".mov",
+}
+
+
+def _save_media(data: bytes, content_type: str) -> str:
+    """Save media bytes to a persistent temp file. Returns the file path."""
+    import time
+    ct = content_type.lower().split(";")[0].strip()
+    ext = _EXT_MAP.get(ct, ".bin")
+    filename = f"wa_media_{int(time.time() * 1000)}{ext}"
+    path = _MEDIA_DIR / filename
+    path.write_bytes(data)
+    print(f"[MEDIA] Saved to {path} ({len(data)} bytes)", flush=True)
+    return str(path)
+
 
 def _twilio_auth() -> httpx.BasicAuth:
     return httpx.BasicAuth(settings.twilio_account_sid, settings.twilio_auth_token)
@@ -176,14 +201,21 @@ async def process_inbound_media(
 
     print(f"[MEDIA] Downloaded {len(data)} bytes", flush=True)
 
+    # Save to disk so Claude can reference the file (e.g. for Drive upload)
+    saved_path = _save_media(data, content_type)
+
     if kind == "image":
         img_block = build_image_block(data, content_type)
         if img_block:
             content_blocks.append(img_block)
+            content_blocks.append({
+                "type": "text",
+                "text": f"[Image saved to: {saved_path}]",
+            })
         else:
             content_blocks.append({
                 "type": "text",
-                "text": "[Image was too large to process]",
+                "text": f"[Image was too large to display but saved to: {saved_path}]",
             })
 
     elif kind == "video":
@@ -195,12 +227,12 @@ async def process_inbound_media(
                 content_blocks.append(img_block)
                 content_blocks.append({
                     "type": "text",
-                    "text": "[This is a frame extracted from a video the user sent. Describe what you see and ask if they need more detail.]",
+                    "text": f"[This is a frame extracted from a video the user sent. Video saved to: {saved_path}]",
                 })
         else:
             content_blocks.append({
                 "type": "text",
-                "text": "[User sent a video but frame extraction is unavailable. Ask them to describe what's in it.]",
+                "text": f"[User sent a video but frame extraction is unavailable. Video saved to: {saved_path}]",
             })
 
     elif kind == "audio":
@@ -208,12 +240,12 @@ async def process_inbound_media(
         if transcript:
             content_blocks.append({
                 "type": "text",
-                "text": f"[Voice message transcription]: {transcript}",
+                "text": f"[Voice message transcription]: {transcript}\n[Audio saved to: {saved_path}]",
             })
         else:
             content_blocks.append({
                 "type": "text",
-                "text": "[User sent a voice message but transcription failed. Let them know and ask them to type their message instead.]",
+                "text": f"[User sent a voice message but transcription failed. Audio saved to: {saved_path}]",
             })
 
     else:

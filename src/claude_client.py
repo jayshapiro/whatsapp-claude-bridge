@@ -25,6 +25,11 @@ MEDIA INPUT:
 - Images arrive as image content blocks — describe what you see and respond helpfully.
 - Voice messages are transcribed to text automatically — respond to the transcription naturally.
 - Videos have a single frame extracted — describe what you see and note it's from a video.
+- All received media is also saved to a local temp file. The path appears as [Image saved to: ...] etc.
+- If the user asks you to save, upload, or share a received image/audio/video, use the mcp_call tool
+  to call the "google-drive" server's "uploadFile" tool with the saved file path and
+  parentFolderId "1iF1dU0-iZbirNXy3XviQvdZrhBT3c1SG" (the public ClaudeCode Dropbox folder).
+  Then share the resulting link: https://drive.google.com/file/d/<FILE_ID>/view
 
 MCP USAGE:
 When the user asks about tasks, notebooks, email, spreadsheets, voice/audio, or video generation, use the mcp_call tool.
