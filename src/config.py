@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # WhatsApp
     max_message_length: int = 1600
 
+    # Optional: user display name for system prompt
+    user_display_name: str = ""
+
+    # Optional: Google Drive folder ID for hosting outbound media
+    google_drive_dropbox_folder_id: str = ""
+
     model_config = {
         "env_file": str(_env_file),
         "env_file_encoding": "utf-8",

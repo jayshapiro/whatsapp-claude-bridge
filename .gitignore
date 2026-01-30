@@ -1,5 +1,29 @@
+# Environment & secrets
 .env
 *.db
+
+# Python
 __pycache__/
-.venv/
 *.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+bridge_log.txt
+
+# Temp media
+whatsapp_media/

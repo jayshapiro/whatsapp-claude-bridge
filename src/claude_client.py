@@ -5,9 +5,46 @@ import anthropic
 from .config import settings
 from .tools.base import BaseTool
 
-_BASE_SYSTEM_PROMPT = """\
-You are Claude, an AI assistant communicating via WhatsApp.
-The user's name is Jay Shapiro.
+def _build_base_prompt() -> str:
+    """Build the base system prompt with configurable user name and Drive folder."""
+    user_line = ""
+    if settings.user_display_name:
+        user_line = f"\nThe user's name is {settings.user_display_name}."
+
+    drive_folder = settings.google_drive_dropbox_folder_id
+
+    # Media input section (Drive upload instructions only if folder configured)
+    media_input_upload = ""
+    if drive_folder:
+        media_input_upload = (
+            f"\n- If the user asks you to save, upload, or share a received image/audio/video, use the mcp_call tool"
+            f'\n  to call the "google-drive" server\'s "uploadFile" tool with the saved file path and'
+            f'\n  parentFolderId "{drive_folder}" (the public Dropbox folder).'
+            f"\n  Then share the resulting link: https://drive.google.com/file/d/<FILE_ID>/view"
+        )
+
+    # Media output section (only if Drive folder configured)
+    media_output = ""
+    if drive_folder:
+        media_output = f"""
+MEDIA OUTPUT (sending to user):
+- You can send images, audio, and video TO the user on WhatsApp using the send_whatsapp_media tool.
+- The media must be at a publicly accessible HTTPS URL.
+- WORKFLOW for sending media:
+  1. Generate or locate the file (e.g. ElevenLabs TTS audio, an image, a video).
+  2. If the file is local, upload it to the Google Drive Dropbox folder via mcp_call:
+     - server: "google-drive", tool: "uploadFile"
+     - localPath: the file path, parentFolderId: "{drive_folder}"
+  3. Get the file ID from the upload result.
+  4. Call send_whatsapp_media with:
+     - media_url: "https://drive.google.com/uc?export=download&id=<FILE_ID>"
+     - caption: optional text to accompany the media
+- IMPORTANT: Use the /uc?export=download&id= URL format, NOT the /file/d/ viewer URL.
+  WhatsApp/Twilio needs a direct download link, not a Google Drive viewer page.
+- Use cases: sending generated audio (TTS), images, charts, documents, videos, etc."""
+
+    return f"""\
+You are Claude, an AI assistant communicating via WhatsApp.{user_line}
 
 CONSTRAINTS:
 - Keep responses concise; WhatsApp messages are capped at ~1 600 characters.
@@ -26,27 +63,8 @@ MEDIA INPUT (receiving from user):
 - Images arrive as image content blocks — describe what you see and respond helpfully.
 - Voice messages are transcribed to text automatically — respond to the transcription naturally.
 - Videos have a single frame extracted — describe what you see and note it's from a video.
-- All received media is also saved to a local temp file. The path appears as [Image saved to: ...] etc.
-- If the user asks you to save, upload, or share a received image/audio/video, use the mcp_call tool
-  to call the "google-drive" server's "uploadFile" tool with the saved file path and
-  parentFolderId "1iF1dU0-iZbirNXy3XviQvdZrhBT3c1SG" (the public ClaudeCode Dropbox folder).
-  Then share the resulting link: https://drive.google.com/file/d/<FILE_ID>/view
-
-MEDIA OUTPUT (sending to user):
-- You can send images, audio, and video TO the user on WhatsApp using the send_whatsapp_media tool.
-- The media must be at a publicly accessible HTTPS URL.
-- WORKFLOW for sending media:
-  1. Generate or locate the file (e.g. ElevenLabs TTS audio, an image, a video).
-  2. If the file is local, upload it to the Google Drive Dropbox folder via mcp_call:
-     - server: "google-drive", tool: "uploadFile"
-     - localPath: the file path, parentFolderId: "1iF1dU0-iZbirNXy3XviQvdZrhBT3c1SG"
-  3. Get the file ID from the upload result.
-  4. Call send_whatsapp_media with:
-     - media_url: "https://drive.google.com/uc?export=download&id=<FILE_ID>"
-     - caption: optional text to accompany the media
-- IMPORTANT: Use the /uc?export=download&id= URL format, NOT the /file/d/ viewer URL.
-  WhatsApp/Twilio needs a direct download link, not a Google Drive viewer page.
-- Use cases: sending generated audio (TTS), images, charts, documents, videos, etc.
+- All received media is also saved to a local temp file. The path appears as [Image saved to: ...] etc.{media_input_upload}
+{media_output}
 
 MCP USAGE:
 When the user asks about tasks, notebooks, email, spreadsheets, voice/audio, or video generation, use the mcp_call tool.
@@ -81,7 +99,7 @@ def _load_claude_md() -> str:
     return ""
 
 
-SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT + _load_claude_md()
+SYSTEM_PROMPT = _build_base_prompt() + _load_claude_md()
 
 
 class ClaudeClient:
