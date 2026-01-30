@@ -16,63 +16,37 @@ from typing import Any, Dict, List, Optional
 
 from .base import BaseTool
 
-# ── MCP server configs (mirrors the user's Claude Code settings.json) ──────
+# ── Load MCP server configs from settings.json (single source of truth) ──────
 
-MCP_SERVERS: Dict[str, Dict[str, Any]] = {
-    "notebooklm": {
-        "command": "C:\\Users\\jay\\AppData\\Roaming\\Python\\Python314\\Scripts\\notebooklm-mcp.exe",
-        "args": [],
-        "env": {},
-        "description": "NotebookLM — create/manage notebooks, add sources, query notebooks, generate audio/video overviews, research topics",
-    },
-    "gmail": {
-        "command": "C:\\Program Files\\nodejs\\npx.cmd",
-        "args": ["@gongrzhe/server-gmail-autoauth-mcp"],
-        "env": {
-            "GMAIL_MCP_CREDENTIALS_PATH": "C:\\Users\\jay\\.gmail-mcp",
-        },
-        "description": "Gmail — search, read, send, draft emails, manage labels and filters",
-    },
-    "google-sheets": {
-        "command": "C:\\Users\\jay\\.local\\bin\\uvx.exe",
-        "args": ["mcp-google-sheets@latest"],
-        "env": {
-            "CREDENTIALS_PATH": "C:\\Users\\jay\\.mcp-sheets\\credentials.json",
-            "TOKEN_PATH": "C:\\Users\\jay\\.mcp-sheets\\token.json",
-        },
-        "description": "Google Sheets — read/write spreadsheets, manage sheets, create spreadsheets",
-    },
-    "elevenlabs": {
-        "command": "C:\\Users\\jay\\.local\\bin\\uvx.exe",
-        "args": ["elevenlabs-mcp"],
-        "env": {
-            "ELEVENLABS_API_KEY": "sk_c3787ae874b222f886464311b0c05c629199fe6f368ddecc",
-        },
-        "description": "ElevenLabs — text-to-speech, voice cloning, sound effects, music generation",
-    },
-    "heygen": {
-        "command": "C:\\Users\\jay\\.local\\bin\\uvx.exe",
-        "args": ["heygen-mcp"],
-        "env": {
-            "HEYGEN_API_KEY": "sk_V2_hgu_kZPgEjl9xXN_NNvk0raYsLNgtpDaxKvQ8H3KEZdQfFws",
-        },
-        "description": "HeyGen — generate AI avatar videos with custom voices",
-    },
-    "gtasks": {
-        "command": "C:\\Program Files\\nodejs\\node.exe",
-        "args": ["C:\\Users\\jay\\gtasks-mcp\\dist\\index.js"],
-        "env": {},
-        "description": "Google Tasks — create, list, search, update, delete tasks and reminders",
-    },
-    "google-drive": {
-        "command": "C:\\Program Files\\nodejs\\node.exe",
-        "args": ["C:\\Users\\jay\\google-drive-mcp\\node_modules\\@piotr-agier\\google-drive-mcp\\dist\\index.js"],
-        "env": {
-            "GOOGLE_DRIVE_OAUTH_CREDENTIALS": "C:\\Users\\jay\\google-drive-mcp\\node_modules\\@piotr-agier\\gcp-oauth.keys.json",
-        },
-        "description": "Google Drive — search, upload, create, move, rename, delete files. Use uploadFile to upload local files (images, audio, video, etc.) to Drive.",
-    },
-}
+def _load_mcp_servers() -> Dict[str, Dict[str, Any]]:
+    """Load MCP server configurations from ~/.claude/settings.json.
+
+    This ensures the bridge always uses the same servers as Claude Code,
+    without needing to maintain a separate registry.
+    """
+    from pathlib import Path
+    settings_path = Path.home() / ".claude" / "settings.json"
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        servers = data.get("mcpServers", {})
+        # Normalise: ensure each server has the keys we need
+        result = {}
+        for name, cfg in servers.items():
+            result[name] = {
+                "command": cfg.get("command", ""),
+                "args": cfg.get("args", []),
+                "env": cfg.get("env", {}),
+                "description": cfg.get("description", f"{name} MCP server"),
+            }
+        print(f"[MCP] Loaded {len(result)} servers from {settings_path}: {', '.join(result.keys())}", flush=True)
+        return result
+    except Exception as e:
+        print(f"[MCP] WARNING: Could not load settings.json: {e}", flush=True)
+        return {}
+
+
+MCP_SERVERS: Dict[str, Dict[str, Any]] = _load_mcp_servers()
 
 
 class MCPBridgeTool(BaseTool):
