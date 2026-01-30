@@ -63,16 +63,22 @@ class ConversationManager:
         self,
         conversation_id: int,
         role: str,
-        content: str,
+        content: Any,
         tool_use_id: Optional[str] = None,
         tool_name: Optional[str] = None,
     ) -> None:
+        # Serialize list/dict content to JSON string for storage
+        if isinstance(content, (list, dict)):
+            stored = json.dumps(content)
+        else:
+            stored = content
+
         with Session(self.engine) as session:
             session.add(
                 Message(
                     conversation_id=conversation_id,
                     role=role,
-                    content=content,
+                    content=stored,
                     tool_use_id=tool_use_id,
                     tool_name=tool_name,
                 )
@@ -122,7 +128,16 @@ class ConversationManager:
         for row in rows:
             if row.role == "user":
                 pending_tool_ids.clear()
-                messages.append({"role": "user", "content": row.content})
+                # Content may be plain text or JSON-encoded blocks (media)
+                try:
+                    parsed = json.loads(row.content)
+                    if isinstance(parsed, list):
+                        content = parsed
+                    else:
+                        content = row.content
+                except (json.JSONDecodeError, TypeError):
+                    content = row.content
+                messages.append({"role": "user", "content": content})
 
             elif row.role == "assistant":
                 pending_tool_ids.clear()

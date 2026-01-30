@@ -20,6 +20,7 @@ from .models import Conversation, Message, PendingApproval  # noqa: F401 (regist
 from .claude_client import ClaudeClient
 from .conversation_manager import ConversationManager
 from .whatsapp_handler import WhatsAppHandler
+from .media_handler import process_inbound_media
 from .tools.bash_tool import BashTool
 from .tools.file_tool import FileReadTool, FileWriteTool
 from .tools.web_search_tool import WebSearchTool
@@ -84,6 +85,16 @@ async def webhook(request: Request):
 
     print(f"[MSG] {from_number}: {body[:80]}")
 
+    # ── extract media attachments ──
+    num_media = int(form.get("NumMedia", "0"))
+    media_items = []
+    for i in range(num_media):
+        url = form.get(f"MediaUrl{i}")
+        ct = form.get(f"MediaContentType{i}", "application/octet-stream")
+        if url:
+            media_items.append({"url": url, "content_type": ct})
+            print(f"[MEDIA] Attachment {i}: {ct} -> {url[:80]}")
+
     # ── special commands ──
     upper = body.upper()
 
@@ -99,7 +110,7 @@ async def webhook(request: Request):
     # ── normal message -> Claude ──
     # run in background so Twilio gets a quick 200
     print(f"[WEBHOOK] Creating _process task for: {body[:60]}", flush=True)
-    task = asyncio.ensure_future(_process(from_number, body))
+    task = asyncio.ensure_future(_process(from_number, body, media_items))
     task.add_done_callback(_task_done)
     print(f"[WEBHOOK] Task created: {task!r}", flush=True)
     return JSONResponse({"status": "ok"})
@@ -155,9 +166,39 @@ def _handle_approval(from_number: str, body: str) -> None:
     whatsapp.send_message(from_number, f"{icon} Request {approval_id} {new_status}.")
 
 
+# ── Media processing ──────────────────────────────────────────────
+
+async def _build_user_content(text: str, media_items: list) -> str | list:
+    """Build user message content: plain string or list of content blocks.
+
+    If there's no media, returns the plain text string (unchanged behaviour).
+    If there is media, returns a list of content blocks for the Claude API.
+    """
+    if not media_items:
+        return text
+
+    blocks = []
+
+    # Process each media attachment
+    for item in media_items:
+        media_blocks = await process_inbound_media(
+            item["url"], item["content_type"], text
+        )
+        blocks.extend(media_blocks)
+
+    # Add the text message (may be empty for media-only messages)
+    if text:
+        blocks.append({"type": "text", "text": text})
+    elif not any(b.get("type") == "text" for b in blocks):
+        # No text and no text blocks from media processing — add a prompt
+        blocks.append({"type": "text", "text": "[The user sent this media without a caption.]"})
+
+    return blocks
+
+
 # ── Claude conversation loop ─────────────────────────────────────
 
-async def _process(from_number: str, text: str) -> None:
+async def _process(from_number: str, text: str, media_items: list | None = None) -> None:
     import sys
     print(f"[PROCESS] Starting for {from_number}: {text[:60]}", flush=True)
     conv = conversations.get_or_create(from_number)
@@ -170,8 +211,11 @@ async def _process(from_number: str, text: str) -> None:
 
     _busy[conv.id] = True
     try:
+        # Build user content blocks (text + any media)
+        user_content = await _build_user_content(text, media_items or [])
+
         # store user message
-        conversations.add_message(conv.id, "user", text)
+        conversations.add_message(conv.id, "user", user_content)
         messages = conversations.get_messages(conv.id)
         print(f"[PROCESS] Sending {len(messages)} messages to Claude...", flush=True)
 
