@@ -3,15 +3,18 @@ MCP Bridge Tool
 ================
 Exposes the user's configured MCP servers (NotebookLM, Gmail, Google Sheets, etc.)
 as a single Claude tool. Claude specifies which server and method to call, and this
-tool spawns the MCP server process, communicates via JSON-RPC over stdio, and returns
-the result.
+tool communicates via JSON-RPC over stdio with persistent server processes.
+
+Architecture:
+  - MCP servers are spawned ONCE and kept alive for the bridge's lifetime.
+  - This mirrors how Claude Code manages MCP servers (persistent connections).
+  - Auth sessions, cookies, and state are preserved across tool calls.
+  - Servers are lazily started on first use and restarted if they crash.
 """
 
 import asyncio
 import json
 import os
-import subprocess
-import sys
 from typing import Any, Dict, List, Optional
 
 from .base import BaseTool
@@ -19,18 +22,13 @@ from .base import BaseTool
 # ── Load MCP server configs from settings.json (single source of truth) ──────
 
 def _load_mcp_servers() -> Dict[str, Dict[str, Any]]:
-    """Load MCP server configurations from ~/.claude/settings.json.
-
-    This ensures the bridge always uses the same servers as Claude Code,
-    without needing to maintain a separate registry.
-    """
+    """Load MCP server configurations from ~/.claude/settings.json."""
     from pathlib import Path
     settings_path = Path.home() / ".claude" / "settings.json"
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         servers = data.get("mcpServers", {})
-        # Normalise: ensure each server has the keys we need
         result = {}
         for name, cfg in servers.items():
             result[name] = {
@@ -48,6 +46,166 @@ def _load_mcp_servers() -> Dict[str, Dict[str, Any]]:
 
 MCP_SERVERS: Dict[str, Dict[str, Any]] = _load_mcp_servers()
 
+
+# ── Persistent MCP server connections ────────────────────────────────────────
+
+class MCPConnection:
+    """A persistent connection to a single MCP server process."""
+
+    def __init__(self, name: str, cfg: Dict[str, Any]):
+        self.name = name
+        self.cfg = cfg
+        self.proc: Optional[asyncio.subprocess.Process] = None
+        self._lock = asyncio.Lock()
+        self._request_id = 10  # Start above init IDs
+        self._initialized = False
+
+    async def ensure_running(self) -> None:
+        """Start the server if not running, or restart if it crashed."""
+        if self.proc is not None and self.proc.returncode is None:
+            if self._initialized:
+                return
+        # Need to start or restart
+        await self._start()
+
+    async def _start(self) -> None:
+        """Spawn the MCP server and initialize it."""
+        # Kill old process if any
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+            except ProcessLookupError:
+                pass
+            self.proc = None
+            self._initialized = False
+
+        command = self.cfg["command"]
+        args = self.cfg.get("args", [])
+        extra_env = self.cfg.get("env", {})
+
+        env = os.environ.copy()
+        env.update(extra_env)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env["NO_UPDATE_NOTIFIER"] = "1"
+
+        print(f"[MCP:{self.name}] Starting: {command} {' '.join(args)}", flush=True)
+
+        self.proc = await asyncio.create_subprocess_exec(
+            command,
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+
+        # Initialize
+        init_msg = _jsonrpc_message(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "whatsapp-bridge", "version": "0.2.0"},
+            },
+            id=1,
+        )
+        self.proc.stdin.write(init_msg)
+        await self.proc.stdin.drain()
+
+        init_response = await asyncio.wait_for(
+            _read_jsonrpc_response(self.proc.stdout), timeout=60
+        )
+
+        if "error" in init_response:
+            stderr_out = await self._drain_stderr()
+            raise RuntimeError(f"Init failed for {self.name}: {init_response['error']}. Stderr: {stderr_out}")
+
+        print(f"[MCP:{self.name}] Initialized OK", flush=True)
+
+        # Send initialized notification
+        notif = _jsonrpc_message("notifications/initialized", {})
+        self.proc.stdin.write(notif)
+        await self.proc.stdin.drain()
+        await asyncio.sleep(0.2)
+
+        self._initialized = True
+
+    async def send_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Send a JSON-RPC request to the running server."""
+        async with self._lock:
+            await self.ensure_running()
+
+            self._request_id += 1
+            rid = self._request_id
+
+            request_msg = _jsonrpc_message(method, params, id=rid)
+            self.proc.stdin.write(request_msg)
+            await self.proc.stdin.drain()
+
+            print(f"[MCP:{self.name}] Sent {method} (id={rid})", flush=True)
+
+            try:
+                response = await asyncio.wait_for(
+                    _read_jsonrpc_response(self.proc.stdout), timeout=120
+                )
+                return response
+            except asyncio.TimeoutError:
+                stderr_out = await self._drain_stderr()
+                # Server might be stuck — kill and let it restart next time
+                self._initialized = False
+                try:
+                    self.proc.kill()
+                except ProcessLookupError:
+                    pass
+                self.proc = None
+                return {"error": f"MCP server '{self.name}' timed out. Stderr: {stderr_out[:300]}"}
+
+    async def _drain_stderr(self) -> str:
+        """Read available stderr."""
+        if self.proc is None or self.proc.stderr is None:
+            return ""
+        try:
+            data = await asyncio.wait_for(self.proc.stderr.read(16384), timeout=5)
+            result = data.decode("utf-8", errors="replace").strip()
+            if result:
+                print(f"[MCP:{self.name} STDERR] {result[:1000]}", flush=True)
+            return result
+        except (asyncio.TimeoutError, Exception):
+            return ""
+
+    async def shutdown(self) -> None:
+        """Cleanly stop the server."""
+        if self.proc is not None:
+            try:
+                self.proc.stdin.close()
+                self.proc.kill()
+            except (ProcessLookupError, BrokenPipeError):
+                pass
+            self.proc = None
+            self._initialized = False
+            print(f"[MCP:{self.name}] Shut down", flush=True)
+
+
+# Global connection pool — one persistent connection per server
+_connections: Dict[str, MCPConnection] = {}
+
+
+def _get_connection(server_name: str) -> MCPConnection:
+    """Get or create a persistent connection to a server."""
+    if server_name not in _connections:
+        _connections[server_name] = MCPConnection(server_name, MCP_SERVERS[server_name])
+    return _connections[server_name]
+
+
+async def shutdown_all_mcp() -> None:
+    """Shut down all persistent MCP connections. Called on bridge exit."""
+    for conn in _connections.values():
+        await conn.shutdown()
+    _connections.clear()
+
+
+# ── The tool itself ──────────────────────────────────────────────────────────
 
 class MCPBridgeTool(BaseTool):
     """Call any configured MCP server tool."""
@@ -110,24 +268,24 @@ class MCPBridgeTool(BaseTool):
         if server_name not in MCP_SERVERS:
             return f"Error: Unknown server '{server_name}'. Available: {', '.join(MCP_SERVERS.keys())}"
 
-        cfg = MCP_SERVERS[server_name]
+        conn = _get_connection(server_name)
 
         try:
             if action == "list_tools":
-                return await self._list_tools(cfg)
+                return await self._list_tools(conn)
             elif action == "call_tool":
                 if not tool_name:
                     return "Error: tool_name is required when action='call_tool'"
-                return await self._call_tool(cfg, tool_name, arguments or {})
+                return await self._call_tool(conn, tool_name, arguments or {})
             else:
                 return f"Error: Unknown action '{action}'. Use 'list_tools' or 'call_tool'."
         except Exception as e:
+            print(f"[MCP:{server_name}] Error: {e}", flush=True)
             return f"MCP error: {e}"
 
-    async def _list_tools(self, cfg: Dict[str, Any]) -> str:
+    async def _list_tools(self, conn: MCPConnection) -> str:
         """List available tools from an MCP server."""
-        print(f"[MCP] Listing tools...", flush=True)
-        result = await self._send_jsonrpc(cfg, "tools/list", {})
+        result = await conn.send_request("tools/list", {})
         if "error" in result:
             return f"Error: {result['error']}"
 
@@ -139,7 +297,6 @@ class MCPBridgeTool(BaseTool):
         for t in tools:
             name = t.get("name", "?")
             desc = t.get("description", "")
-            # Truncate long descriptions for WhatsApp readability
             if len(desc) > 100:
                 desc = desc[:100] + "..."
             lines.append(f"- **{name}**: {desc}")
@@ -147,18 +304,14 @@ class MCPBridgeTool(BaseTool):
         return f"Available tools ({len(tools)}):\n" + "\n".join(lines)
 
     async def _call_tool(
-        self, cfg: Dict[str, Any], tool_name: str, arguments: Dict[str, Any]
+        self, conn: MCPConnection, tool_name: str, arguments: Dict[str, Any]
     ) -> str:
         """Call a specific tool on an MCP server."""
-        print(f"[MCP] Calling tool: {tool_name} with args: {arguments}", flush=True)
-        result = await self._send_jsonrpc(
-            cfg,
+        result = await conn.send_request(
             "tools/call",
             {"name": tool_name, "arguments": arguments},
         )
-        print(f"[MCP] Tool result keys: {list(result.keys())}", flush=True)
         if "error" in result:
-            print(f"[MCP] Tool error: {result['error']}", flush=True)
             return f"Error: {result['error']}"
 
         content = result.get("result", {}).get("content", [])
@@ -179,126 +332,19 @@ class MCPBridgeTool(BaseTool):
 
         return output
 
-    async def _send_jsonrpc(
-        self, cfg: Dict[str, Any], method: str, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Spawn MCP server, send JSON-RPC initialize + request, return result."""
 
-        command = cfg["command"]
-        args = cfg.get("args", [])
-        extra_env = cfg.get("env", {})
-
-        env = os.environ.copy()
-        env.update(extra_env)
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
-        # Suppress npm update-notifier noise
-        env["NO_UPDATE_NOTIFIER"] = "1"
-
-        print(f"[MCP] Spawning: {command} {' '.join(args)}", flush=True)
-
-        proc = await asyncio.create_subprocess_exec(
-            command,
-            *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-
-        try:
-            # Step 1: Send initialize
-            init_msg = _jsonrpc_message(
-                "initialize",
-                {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "whatsapp-bridge", "version": "0.1.0"},
-                },
-                id=1,
-            )
-            proc.stdin.write(init_msg)
-            await proc.stdin.drain()
-
-            # Read initialize response (generous timeout for slow servers)
-            print("[MCP] Waiting for initialize response...", flush=True)
-            init_response = await asyncio.wait_for(
-                _read_jsonrpc_response(proc.stdout), timeout=60
-            )
-            print(f"[MCP] Init response: {json.dumps(init_response)[:500]}", flush=True)
-            if "error" in init_response:
-                stderr_out = await _drain_stderr(proc)
-                print(f"[MCP] Init FAILED. Stderr: {stderr_out[:500]}", flush=True)
-                return {"error": f"Init failed: {init_response['error']}. Stderr: {stderr_out}"}
-            print(f"[MCP] Initialized OK", flush=True)
-
-            # Step 2: Send initialized notification
-            notif = _jsonrpc_message("notifications/initialized", {})
-            proc.stdin.write(notif)
-            await proc.stdin.drain()
-
-            # Small delay to let server process notification
-            await asyncio.sleep(0.2)
-
-            # Step 3: Send the actual request
-            request_msg = _jsonrpc_message(method, params, id=2)
-            proc.stdin.write(request_msg)
-            await proc.stdin.drain()
-
-            # Read response
-            print(f"[MCP] Waiting for {method} response...", flush=True)
-            response = await asyncio.wait_for(
-                _read_jsonrpc_response(proc.stdout), timeout=120
-            )
-            print(f"[MCP] Got response: {json.dumps(response)[:500]}", flush=True)
-
-            return response
-
-        except asyncio.TimeoutError:
-            stderr_out = await _drain_stderr(proc)
-            print(f"[MCP] Timeout! Stderr: {stderr_out[:500]}", flush=True)
-            return {"error": f"MCP server timed out. Stderr: {stderr_out[:300]}"}
-        except Exception as e:
-            stderr_out = await _drain_stderr(proc)
-            print(f"[MCP] Error: {e}. Stderr: {stderr_out[:500]}", flush=True)
-            return {"error": f"MCP error: {e}. Stderr: {stderr_out[:300]}"}
-        finally:
-            proc.stdin.close()
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-
-
-async def _drain_stderr(proc) -> str:
-    """Read whatever is available on stderr (non-blocking)."""
-    try:
-        stderr_data = await asyncio.wait_for(proc.stderr.read(16384), timeout=5)
-        result = stderr_data.decode("utf-8", errors="replace").strip()
-        if result:
-            print(f"[MCP STDERR] {result[:1000]}", flush=True)
-        return result
-    except (asyncio.TimeoutError, Exception):
-        return ""
-
+# ── JSON-RPC helpers ─────────────────────────────────────────────────────────
 
 def _jsonrpc_message(
     method: str, params: Dict[str, Any], id: Optional[int] = None
 ) -> bytes:
-    """Build a JSON-RPC message as a newline-delimited JSON line.
-
-    Some MCP servers (FastMCP) expect raw JSON lines on stdio.
-    Others expect Content-Length framing.  We send BOTH formats
-    (Content-Length header + body) so either flavour works.
-    """
+    """Build a JSON-RPC message as a newline-delimited JSON line."""
     msg: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
     if params:
         msg["params"] = params
     if id is not None:
         msg["id"] = id
     body = json.dumps(msg)
-    # Send as raw JSON line (no Content-Length header).
-    # FastMCP (notebooklm-mcp) requires this.
     return (body + "\n").encode("utf-8")
 
 
@@ -312,7 +358,7 @@ async def _read_jsonrpc_response(stdout: asyncio.StreamReader) -> Dict[str, Any]
     Skips notifications (messages without an "id" field) and
     junk lines (npm output, startup messages).
     """
-    max_lines = 200  # safety valve
+    max_lines = 200
     content_length = 0
 
     for _ in range(max_lines):
@@ -322,18 +368,15 @@ async def _read_jsonrpc_response(stdout: asyncio.StreamReader) -> Dict[str, Any]
 
         line_str = line.decode("utf-8", errors="replace").strip()
         if not line_str:
-            # Empty line: if we have a pending Content-Length, read framed body
             if content_length > 0:
                 body = await stdout.readexactly(content_length)
                 data = json.loads(body.decode("utf-8"))
                 content_length = 0
                 if "id" not in data:
-                    # notification — skip and keep reading
                     continue
                 return data
             continue
 
-        # Check for Content-Length header (LSP framing)
         if line_str.lower().startswith("content-length:"):
             try:
                 content_length = int(line_str.split(":", 1)[1].strip())
@@ -341,19 +384,13 @@ async def _read_jsonrpc_response(stdout: asyncio.StreamReader) -> Dict[str, Any]
                 pass
             continue
 
-        # Try to parse as raw JSON
         try:
             data = json.loads(line_str)
             if isinstance(data, dict):
                 if "id" not in data:
-                    # notification — skip
-                    print(f"[MCP notification] {line_str[:300]}", flush=True)
                     continue
                 return data
         except (json.JSONDecodeError, ValueError):
             pass
-
-        # Otherwise it's junk (npm output, startup messages)
-        print(f"[MCP stdout junk] {line_str[:500]}", flush=True)
 
     return {"error": "Exceeded max lines without receiving a JSON-RPC response"}

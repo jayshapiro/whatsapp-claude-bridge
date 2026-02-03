@@ -11,8 +11,8 @@ import json
 import uuid
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.responses import JSONResponse, Response
 from sqlmodel import SQLModel, Session, create_engine, select
 
 from .config import settings
@@ -24,12 +24,19 @@ from .media_handler import process_inbound_media
 from .tools.bash_tool import BashTool
 from .tools.file_tool import FileReadTool, FileWriteTool
 from .tools.web_search_tool import WebSearchTool
-from .tools.mcp_tool import MCPBridgeTool
+from .tools.mcp_tool import MCPBridgeTool, shutdown_all_mcp
 from .tools.send_media_tool import SendWhatsAppMediaTool
+from .voice_handler import handle_voice_websocket, build_voice_twiml
 
 # ── Initialise components ────────────────────────────────────────
 
 app = FastAPI(title="WhatsApp-Claude Bridge")
+
+
+@app.on_event("shutdown")
+async def _shutdown_event():
+    """Clean up persistent MCP server connections on exit."""
+    await shutdown_all_mcp()
 
 engine = create_engine(settings.database_url, echo=False)
 SQLModel.metadata.create_all(engine)
@@ -55,6 +62,34 @@ async def health():
 @app.get("/webhook")
 async def webhook_verify():
     return {"status": "ok", "message": "Webhook endpoint ready"}
+
+
+@app.post("/voice")
+async def voice_incoming(request: Request):
+    """Handle incoming WhatsApp/phone voice calls.
+
+    Returns TwiML that connects the call to ConversationRelay,
+    which bridges to our /ws WebSocket endpoint.
+    """
+    form = await request.form()
+    from_number = (form.get("From") or "").replace("whatsapp:", "")
+    call_sid = form.get("CallSid", "unknown")
+    print(f"[VOICE] Incoming call from {from_number}, CallSid={call_sid}", flush=True)
+
+    # Build the WebSocket URL from this request's host
+    host = request.headers.get("host", f"{settings.server_host}:{settings.server_port}")
+    # Use wss:// since ngrok provides TLS
+    ws_url = f"wss://{host}/ws"
+    print(f"[VOICE] ConversationRelay WebSocket URL: {ws_url}", flush=True)
+
+    twiml = build_voice_twiml(ws_url)
+    return Response(content=twiml, media_type="text/xml")
+
+
+@app.websocket("/ws")
+async def voice_websocket(ws: WebSocket):
+    """WebSocket endpoint for Twilio ConversationRelay."""
+    await handle_voice_websocket(ws)
 
 
 @app.post("/webhook")
@@ -403,8 +438,12 @@ def main():
     print(f"  Model : {settings.claude_model}")
     print(f"  Server: http://{settings.server_host}:{settings.server_port}")
     print()
+    print("Endpoints:")
+    print(f"  Messages:  https://<ngrok-url>/webhook  (POST)")
+    print(f"  Voice:     https://<ngrok-url>/voice    (POST)")
+    print(f"  WebSocket: wss://<ngrok-url>/ws         (ConversationRelay)")
+    print()
     print("Expose with:  ngrok http", settings.server_port)
-    print("Set Twilio webhook to:  https://<ngrok-url>/webhook  (POST)")
     print()
 
     uvicorn.run(
